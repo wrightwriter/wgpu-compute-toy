@@ -1,4 +1,4 @@
-use crate::WgpuContext;
+use crate::{WgpuContext, audio::AUDIO_BUFF_SIZE};
 use bitvec::prelude::*;
 use itertools::Itertools;
 use num::Integer;
@@ -120,6 +120,10 @@ pub struct Time {
     pub frame: u32,
     pub elapsed: f32,
     pub delta: f32,
+
+    pub sample: u32,
+    pub total: f32,
+    pub bpm: f32,
 }
 
 #[derive(Clone, Copy, bytemuck::Zeroable, bytemuck::Pod)]
@@ -140,6 +144,8 @@ pub struct Bindings {
     pub storage2: BufferBinding<()>,
     pub debug_buffer: BufferBinding<()>,
     pub dispatch_info: BufferBinding<()>,
+    pub audio_output_buffer: BufferBinding<()>,
+
 
     pub tex_screen: TextureBinding,
     pub tex_read: TextureBinding,
@@ -266,6 +272,9 @@ impl Bindings {
                     frame: 0,
                     elapsed: 0.,
                     delta: 0.,
+                    sample: 0,
+                    total: 0.0,
+                    bpm: 0.0,
                 },
                 serialise: Box::new(|h| bytemuck::bytes_of(h).to_vec()),
                 device: wgpu.device.create_buffer(&wgpu::BufferDescriptor {
@@ -355,7 +364,7 @@ impl Bindings {
                 device: wgpu.device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
                     size: 134217728, // default limit (128 MiB)
-                    usage: wgpu::BufferUsages::STORAGE,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 }),
                 layout: storage_buffer,
@@ -389,6 +398,21 @@ impl Bindings {
                 layout: storage_buffer,
                 bind: Box::new(wgpu::Buffer::as_entire_buffer_binding),
                 decl: "var<storage,read_write> _assert_counts: array<atomic<u32>>".to_string(),
+            },
+            audio_output_buffer: BufferBinding {
+                host: (),
+                serialise: Box::new(|_| vec![]),
+                device: wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: (size_of::<f32>()*AUDIO_BUFF_SIZE as usize *4) as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_SRC
+                        | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                layout: storage_buffer,
+                bind: Box::new(wgpu::Buffer::as_entire_buffer_binding),
+                decl: "var<storage,read_write> audio_out: array<f32>".to_string(),
             },
             dispatch_info: BufferBinding {
                 host: (),
@@ -530,6 +554,7 @@ impl Bindings {
             &self.custom,
             &self.user_data,
             &self.debug_buffer,
+            &self.audio_output_buffer,
             &self.dispatch_info,
             &self.tex_screen,
             &self.tex_read,

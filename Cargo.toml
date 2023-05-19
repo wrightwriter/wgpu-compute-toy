@@ -67,6 +67,27 @@ version = "0.24.2"
 default-features = false
 features = ["png", "jpeg", "hdr"]
 
+[dependencies.web-sys]
+version = "0.3.57"
+features = [
+  'AudioContext',
+  'AudioBuffer',
+  'AudioBufferSourceOptions',
+  'AudioBufferOptions',
+  'AudioContextState',
+  'AudioContextOptions',
+  'AudioConfiguration',
+  'AudioBufferSourceNode',
+  'AudioDestinationNode',
+  'Window',
+  'EventTarget',
+  'AudioNode',
+  'AudioParam',
+  'GainNode',
+  'OscillatorNode',
+  'OscillatorType',
+]
+
 [dependencies.instant]
 version = "0.1.12"
 features = ["wasm-bindgen"]

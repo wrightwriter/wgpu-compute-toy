@@ -3,13 +3,16 @@ mod blit;
 pub mod context;
 mod pp;
 mod utils;
+mod audio;
 
+use audio::{WebAudioContext, AUDIO_BUFF_SIZE, AUDIO_BUFF_TYPE};
 use context::{init_wgpu, WgpuContext};
 use lazy_regex::regex;
-use num::Integer;
+use num::{Integer, ToPrimitive};
 use pp::{SourceMap, WGSLError};
 use std::collections::HashMap;
 use std::mem::{size_of, take};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -62,6 +65,9 @@ struct ComputePipeline {
 pub struct WgpuToyRenderer {
     #[wasm_bindgen(skip)]
     pub wgpu: WgpuContext,
+    #[wasm_bindgen(skip)]
+    #[cfg(target_arch = "wasm32")]
+    pub web_audio_ctx: WebAudioContext,
     screen_width: u32,
     screen_height: u32,
     bindings: bind::Bindings,
@@ -106,8 +112,13 @@ impl WgpuToyRenderer {
             wgpu.surface_config.width,
             wgpu.surface_config.height,
             false,
-        );
+        ); 
         let layout = bindings.create_bind_group_layout(&wgpu);
+        #[cfg(target_arch = "wasm32")]
+        let web_audio_ctx = WebAudioContext::new().unwrap();
+        // #[cfg(target_arch = "wasm32")]
+        // log::info!("WEBAUDIO");
+        
 
         WgpuToyRenderer {
             compute_pipeline_layout: bindings.create_pipeline_layout(&wgpu, &layout),
@@ -125,6 +136,8 @@ impl WgpuToyRenderer {
                 wgpu::FilterMode::Nearest,
             ),
             wgpu,
+            #[cfg(target_arch = "wasm32")]
+            web_audio_ctx,
             bindings,
             on_success_cb: SuccessCallback(None),
             pass_f32: false,
@@ -180,16 +193,179 @@ impl WgpuToyRenderer {
                 SurfaceError::Timeout => log::warn!("Surface Timeout"),
             },
             Ok(f) => {
+
                 let staging_buffer = self.render_to(f);
                 Self::postrender(
                     staging_buffer,
                     self.screen_width * self.screen_height,
-                    self.source.assert_map.clone(),
-                )
-                .await
+                    self.source.assert_map.clone()
+                ).await
             }
         }
     }
+    
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen]
+    pub fn play_audio(&mut self) {
+        // self.web_audio_ctx.update();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen]
+    pub async fn render_audio_api(&mut self) { 
+        self.web_audio_ctx.update_time();
+        if(self.web_audio_ctx.needs_update){
+            if self.web_audio_ctx.t_readback == 0. {
+                self.web_audio_ctx.t_readback = self.web_audio_ctx.t;
+                let audio_buff_clone = self.web_audio_ctx.readback_buffer.clone();
+                let gpu_buff = self.render_audio();
+                let future = Self::post_render_audio(gpu_buff, audio_buff_clone);
+                utils::promise( future);
+            } else {
+                self.web_audio_ctx.try_push_audio();
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn render_audio(&mut self) -> wgpu::Buffer {
+        let mut encoder = self.wgpu.device.create_command_encoder(&Default::default());
+
+
+        let t: f64 = self.web_audio_ctx.t; 
+        self.bindings.time.host.bpm = 128.0;
+        self.bindings.time.host.total = t as f32;
+        self.bindings.time.host.sample = self.web_audio_ctx.sample;
+        self.bindings.stage(&self.wgpu.queue);
+        // let mut t_synced = (self.bindings.time.host.bpm as f64) * (t / 60.0);
+        // let t_id = t_synced.floor();
+        // t_synced = t_synced % 1.0;
+        
+        // // let t_synced_f32 = t_synced.to_f32().unwrap();
+        // let t_synced_f32 = t_synced as f32;
+        
+        // self.bindings.time.host.bars = t_synced_f32;
+        // self.bindings.time.host.bar = (t_synced_f32) % (1./(16.));
+        // self.bindings.time.host.beat = (t_synced_f32) % (1./(16.0*4.0));
+        // self.bindings.time.host.qbeat = (t_synced_f32) % (1./(16.0*4.0*4.0));
+
+
+
+        if SHADER_ERROR.swap(false, Ordering::SeqCst) {
+            match take(&mut self.last_compute_pipelines) {
+                None => log::warn!("unable to rollback shader after error"),
+                Some(vec) => {
+                    self.compute_pipelines = vec;
+                }
+            }
+        }
+
+        let mut dispatch_counter = 0;
+        for (pass_index, p) in self.compute_pipelines.iter().enumerate() {
+            for i in 0..p.dispatch_count {
+                let mut compute_pass = encoder.begin_compute_pass(&Default::default());
+                if let Some(q) = &self.query_set {
+                    compute_pass.write_timestamp(q, 2 * pass_index as u32);
+                }
+                let workgroup_count = p.workgroup_count.unwrap_or([
+                    self.screen_width.div_ceil(&p.workgroup_size[0]),
+                    self.screen_height.div_ceil(&p.workgroup_size[1]),
+                    1,
+                ]);
+                compute_pass.set_pipeline(&p.pipeline);
+                self.wgpu.queue.write_buffer(
+                    self.bindings.dispatch_info.buffer(),
+                    bind::OFFSET_ALIGNMENT as u64 * dispatch_counter,
+                    bytemuck::bytes_of(&i),
+                );
+                compute_pass.set_bind_group(
+                    0,
+                    &self.compute_bind_group,
+                    &[bind::OFFSET_ALIGNMENT as u32 * dispatch_counter as u32],
+                );
+                dispatch_counter += 1;
+                compute_pass.dispatch_workgroups(
+                    workgroup_count[0],
+                    workgroup_count[1],
+                    workgroup_count[2],
+                );
+                if let Some(q) = &self.query_set {
+                    compute_pass.write_timestamp(q, 2 * pass_index as u32 + 1);
+                }
+                drop(compute_pass);
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: self.bindings.tex_write.texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: self.bindings.tex_read.texture(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: self.screen_width,
+                        height: self.screen_height,
+                        depth_or_array_layers: 4,
+                    },
+                );
+            }
+        }
+
+        // ! CREATE BUFF
+        let sz = 1*(AUDIO_BUFF_SIZE as usize * size_of::<f32>()) as wgpu::BufferAddress;
+        let buf = self.wgpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: sz as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // ! COPY
+        encoder.copy_buffer_to_buffer( self.bindings.audio_output_buffer.buffer(), 0, &buf, 0, sz,);
+        
+        // ! SUBMIT 
+        self.wgpu.queue.submit(Some(encoder.finish()));
+
+        buf
+    }
+
+
+    #[cfg(target_arch = "wasm32")]
+    async fn post_render_audio(gpu_buff: wgpu::Buffer,audio_buff: AUDIO_BUFF_TYPE ) -> Option<f32> {
+        let buffer_slice = gpu_buff.slice(..);
+        let (sender, receiver) = futures_intrusive::channel::shared::oneshot_channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |v| match sender.send(v) {
+            Ok(()) => {}
+            Err(_) => log::error!("Channel closed unexpectedly"),
+        });
+        match receiver.receive().await {
+            None => log::error!("Channel closed unexpectedly"),
+            Some(Err(e)) => log::error!("{e}"),
+            Some(Ok(())) => {
+                let data = buffer_slice.get_mapped_range();
+                let cpu_slice: &[f32] = bytemuck::cast_slice(&data[0..size_of::<f32>()*AUDIO_BUFF_SIZE as usize]);
+
+                let mut audio_buff_borrow = audio_buff.borrow_mut();
+                
+                for i in 0..AUDIO_BUFF_SIZE as usize{
+                    audio_buff_borrow[i] = cpu_slice[i];
+                }
+                // let mut i = 0;
+                // for element in &mut *audio_buff_borrow {
+                //     *element = cpu_slice[i];
+                //     i += 1;
+                // }
+            }
+        }
+        gpu_buff.unmap();
+        gpu_buff.destroy();
+        Some(1.0)
+    }
+
 
     fn render_to(&mut self, frame: wgpu::SurfaceTexture) -> Option<wgpu::Buffer> {
         let mut encoder = self.wgpu.device.create_command_encoder(&Default::default());
@@ -301,8 +477,8 @@ impl WgpuToyRenderer {
             &mut encoder,
             &frame.texture.create_view(&Default::default()),
         );
-        self.wgpu.queue.submit(Some(encoder.finish()));
-        frame.present();
+            self.wgpu.queue.submit(Some(encoder.finish()));
+            frame.present();
         staging_buffer
     }
 
@@ -367,7 +543,13 @@ impl WgpuToyRenderer {
         }
         s.push_str(
             r#"
-struct Time { frame: uint, elapsed: float, delta: float }
+struct Time { 
+    frame: uint, elapsed: float, delta: float,
+
+    sample: u32,
+    total: float,
+    bpm: float,
+}
 struct Mouse { pos: uint2, click: int }
 struct DispatchInfo { id: uint }
 "#,
@@ -644,6 +826,7 @@ fn passSampleLevelBilinearRepeat(pass_index: int, uv: float2, lod: float) -> flo
     pub fn on_success(&mut self, callback: js_sys::Function) {
         self.on_success_cb = SuccessCallback(Some(callback));
     }
+
 
     pub fn load_channel(&mut self, index: usize, bytes: &[u8]) {
         let now = instant::Instant::now();
